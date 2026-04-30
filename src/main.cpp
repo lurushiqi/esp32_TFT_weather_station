@@ -2,7 +2,6 @@
 #include <WiFi.h>
 #include <SPI.h>
 #include <TFT_eSPI.h>
-#include <JPEGDecoder.h>
 #include <WiFiUdp.h>
 #include <NTPClient.h>
 #include <OneButton.h>
@@ -19,7 +18,7 @@ const uint16_t MQTT_PORT = 1883;
 const char* MQTT_SUB_TOPIC = "weather_station_data";
 
 #include "msyh16.h"
-#include "O128.h"
+#include "kaijitu.h"
 #include "temp.h"
 #include "shidu.h"
 #include "CO2.h"
@@ -87,7 +86,7 @@ void setup()
   tft.setRotation(TFT_ROTATION);
   tft.fillScreen(TFT_WHITE);
 
-  drawArrayJpeg(O128, sizeof(O128), 0, 16);
+  tft.pushImage(0, 0, KAIJITU_WIDTH, KAIJITU_HEIGHT, (uint16_t*)kaijitu);
   delay(2000);
 
   btn.attachClick(changePage);
@@ -361,37 +360,4 @@ void showNoNetworkScreen() {
   tft.setTextDatum(MC_DATUM);
   tft.drawString("未连接到网络",64,100);
   tft.unloadFont();
-}
-
-// ====================== JPEG ======================
-void drawArrayJpeg(const uint8_t arrayname[], uint32_t array_size, int xpos, int ypos)
-{
-  JpegDec.decodeArray(arrayname, array_size);
-  renderJPEG(xpos,ypos);
-}
-
-void renderJPEG(int xpos, int ypos)
-{
-  uint16_t *pImg;
-  uint16_t mcu_w = JpegDec.MCUWidth;
-  uint16_t mcu_h = JpegDec.MCUHeight;
-  uint32_t max_x = JpegDec.width;
-  uint32_t max_y = JpegDec.height;
-  uint32_t min_w = minimum(mcu_w, max_x % mcu_w);
-  uint32_t min_h = minimum(mcu_h, max_y % mcu_h);
-  uint32_t win_w = mcu_w;
-  uint32_t win_h = mcu_h;
-  max_x += xpos;
-  max_y += ypos;
-
-  while (JpegDec.readSwappedBytes()) {
-    pImg = JpegDec.pImage;
-    int mcu_x = JpegDec.MCUx * mcu_w + xpos;
-    int mcu_y = JpegDec.MCUy * mcu_h + ypos;
-
-    if (mcu_x + mcu_w <= max_x) win_w = mcu_w; else win_w = min_w;
-    if (mcu_y + mcu_h <= max_y) win_h = mcu_h; else win_h = min_h;
-
-    tft.pushRect(mcu_x, mcu_y, win_w, win_h, pImg);
-  }
 }
