@@ -50,6 +50,8 @@ PubSubClient mqtt(espClient);
 #define C_PURPLE tft.color565(139,  92, 246)
 #define C_SLATE  tft.color565(100, 116, 139)
 #define C_LIME   tft.color565(132, 204,  22)
+// MQTT 断开时用的灰色
+#define C_OFFLINE tft.color565(170, 176, 185)
 
 // ============================== 版 面 常 量 ==============================
 #define TOPBAR_H  18
@@ -161,11 +163,16 @@ uint16_t cardPlate(uint8_t idx) {
 void drawListCard(const uint16_t* icon, const char* label,
                   const String& value, const char* unit,
                   uint8_t idx, int y, uint16_t valColor) {
+  // MQTT 断了就把这张卡片变灰，数值显示 "--"
+  uint16_t vc = valColor;
+  String   vs = value;
+  if (!mqttOK) { vc = C_OFFLINE; vs = "--"; }
+
   // 卡片底
   const uint16_t plate = cardPlate(idx);
   tft.fillRoundRect(CARD_X, y, CARD_W, CARD_H, 4, plate);
   // 底部细色条（两侧内缩，收在圆角内）
-  tft.fillRoundRect(CARD_X + 6, y + CARD_H - 3, CARD_W - 12, 2, 1, valColor);
+  tft.fillRoundRect(CARD_X + 6, y + CARD_H - 3, CARD_W - 12, 2, 1, vc);
 
   // 图标：宽高必须和图标数组的真实尺寸一致（现在是 28x28）
   // 之前这里写 28x28 但数组是 32x32，pushImage 不会缩放、只按 28 宽顺序读数据，
@@ -179,9 +186,9 @@ void drawListCard(const uint16_t* icon, const char* label,
   // 文字背景色必须传卡片底色，否则抗锯齿边缘会被糊上一圈黑灰描边
   drawLabel(label, TEXT_X, y + LABEL_Y_OFF, plate);
 
-  String v = value;
-  if (unit && unit[0]) v += unit;
-  drawValue(v, TEXT_X, y + VALUE_Y_OFF, valColor, plate);
+  String v = vs;
+  if (mqttOK && unit && unit[0]) v += unit;   // 断网时不带单位，只显示 "--"
+  drawValue(v, TEXT_X, y + VALUE_Y_OFF, vc, plate);
 }
 
 // ============================== 顶 栏 ==============================
@@ -485,7 +492,7 @@ void setup() {
   mqtt.setServer(MQTT_SERVER, MQTT_PORT);
   mqtt.setCallback(onMqttMessage);
   mqtt.setBufferSize(256);
-  mqtt.setKeepAlive(30);
+  mqtt.setKeepAlive(30);   // 30 秒没收到服务器回应就判定断线，屏幕随即变灰
 
   // 开机页 2.5 秒，期间后台继续连网
   drawWelcome();
@@ -531,6 +538,13 @@ void loop() {
     return;
   } else if (showingNoNet) {
     showingNoNet = false;
+    needRedraw = true;
+  }
+
+  // MQTT 一通一断，立刻重画屏幕（变灰或恢复原样）
+  static bool lastMqttOK = false;
+  if (mqttOK != lastMqttOK) {
+    lastMqttOK = mqttOK;
     needRedraw = true;
   }
 
