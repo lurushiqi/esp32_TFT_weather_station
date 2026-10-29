@@ -15,8 +15,6 @@
 #include "air.h"          // 空气质量 32x32
 #include "tvoc.h"         // TVOC 32x32
 #include "msyh16.h"       // 16px 中文字库（数值 + 标签 + 星期，全用它）
-#include "msyh12.h"       // 16px 纯 ASCII 备选（当前 UI 未使用，留着备用）
-#include "network.h"      // 网络图标（备用）
 
 // ============================== 用 户 配 置 ==============================
 const char* WIFI_SSID     = "iQOO";
@@ -24,7 +22,19 @@ const char* WIFI_PASSWORD = "llllffff";
 
 const char* MQTT_SERVER   = "broker.emqx.io";
 const int   MQTT_PORT     = 1883;
-const char* MQTT_TOPIC    = "weather_station_data";
+
+// ============================== MQTT 主 题 ==============================
+// 必须与检测端（发布方）完全一致。检测端用 MQTT_TOPIC_BASE 统一前缀，默认 "weather/"，
+// 4 个主题会同步变化
+//    weather/temp_hum  → "温度,湿度"
+//    weather/press_alt → "气压,海拔"
+//    weather/air       → "CO2,TVOC,空气质量"
+//    weather/rain      → "雨量ADC,雨量等级"
+const char* MQTT_TOPIC_BASE = "weather/";
+String      topicTempHum;     // 温湿度
+String      topicPressAlt;    // 气压海拔
+String      topicAir;         // 空气：CO2 + TVOC + 空气质量
+String      topicRain;        // 雨量
 
 // ============================== 硬 件 定 义 ==============================
 #define TFT_ROTATION   0        // 竖屏 128(宽) x 160(高)
@@ -83,8 +93,17 @@ struct WeatherData {
 };
 WeatherData d;              // 全局保留：断网重连后不会丢
 
+// ===== 检测端数据新鲜度（检测端断电/掉线后自动变 "--"，防止旧数据误导） =====
+// 检测端每 5 秒发一次数据（READ_INTERVAL=5000），这里 15 秒（3 个周期）没收到
+// 就判定检测端掉线：所有卡片数值变 "--"。注意 mqttOK 只管"MQTT 连着没"——
+// 检测端断电时显示端连的是公网 broker，MQTT 其实还是通的，必须靠数据新鲜度区分。
+#define DATA_TIMEOUT_MS 15000
+unsigned long lastDataMs  = 0;     // 最后一次收到检测端数据的时间（millis）
+bool          dataFresh   = false; // 数据是否新鲜（收到过数据且未超时）
+
 uint8_t page = 0;
 bool    needRedraw = true;
+bool    needRefresh = false;   // 数据更新只重画数值，不整屏重画（局部刷新）
 
 bool          mqttOK      = false;
 unsigned long mqttBackoff = 3000;
@@ -152,21 +171,21 @@ uint16_t cardPlate(uint8_t idx) {
   }
 }
 
-// 
+//
 //  一行列表卡（卡高 32）：
 //    +------------------------------------------------+
 //    | [图标28]  标签（12px，灰）                       | y+3
 //    |           数值（16px，彩色，带单位）             | y+15
 //    +------------------------------------------------+
 //  注意：不再有"灰色/无数据"状态，图标和配色永远是正常的
-// 
+//
 void drawListCard(const uint16_t* icon, const char* label,
                   const String& value, const char* unit,
                   uint8_t idx, int y, uint16_t valColor) {
-  // MQTT 断了就把这张卡片变灰，数值显示 "--"
-  uint16_t vc = valColor;
-  String   vs = value;
-  if (!mqttOK) { vc = C_OFFLINE; vs = "--"; }
+  // MQTT 断了，或检测端超过 15 秒没发数据（断电/掉线），就把卡片变灰、数值显示 "--"
+  bool off = (!mqttOK || !dataFresh);
+  uint16_t vc = off ? C_OFFLINE : valColor;
+  String   vs = off ? "--" : value;
 
   // 卡片底
   const uint16_t plate = cardPlate(idx);
@@ -187,7 +206,7 @@ void drawListCard(const uint16_t* icon, const char* label,
   drawLabel(label, TEXT_X, y + LABEL_Y_OFF, plate);
 
   String v = vs;
-  if (mqttOK && unit && unit[0]) v += unit;   // 断网时不带单位，只显示 "--"
+  if (!off && unit && unit[0]) v += unit;   // 掉线时不带单位，只显示 "--"
   drawValue(v, TEXT_X, y + VALUE_Y_OFF, vc, plate);
 }
 
@@ -202,10 +221,10 @@ void drawTopBar() {
   struct tm ti;
   bool ok = getLocalTime(&ti, 0);      // NTP 没同步成功时为 false，下面都按"--"处理
 
-  // ① 左：时钟
+  // ① 左：时钟（含秒；顶栏每秒重画一次，正好配合秒的跳动）
   //    字库上沿 13。数字 dY=12、字高 12，光标 y=2 时数字占 3~15，在 18px 顶栏里居中
-  char b[8] = "--:--";
-  if (ok) sprintf(b, "%02d:%02d", ti.tm_hour, ti.tm_min);
+  char b[12] = "--:--:--";
+  if (ok) sprintf(b, "%02d:%02d:%02d", ti.tm_hour, ti.tm_min, ti.tm_sec);
   tft.loadFont(msyh16);
   tft.setTextDatum(TL_DATUM);
   tft.setTextColor(TFT_WHITE, C_BAR);        // ★ 背景色必须给，否则字边糊黑圈
@@ -213,19 +232,19 @@ void drawTopBar() {
   tft.print(b);
   tft.unloadFont();
 
-  // ② 中：星期（屏幕正中）
+  // ② 中：星期（加了秒之后时钟变宽，星期改右对齐避让，右缘停在 116，给状态灯留位）
   //    汉字 dY=13、字高 14，光标 y=2 时字身正好占 2~16
   const char* w = ok ? WEEK_NAME[ti.tm_wday] : "--";
   tft.loadFont(msyh16);
   tft.setTextDatum(TL_DATUM);
   tft.setTextColor(TFT_WHITE, C_BAR);        // ★ 同上
-  tft.setCursor(64 - tft.textWidth(w) / 2, 2);
+  tft.setCursor(116 - tft.textWidth(w), 2);
   tft.print(w);
   tft.unloadFont();
 
-  // ③ 右：网络状态灯  绿=MQTT 通 / 橙=WiFi 通但 MQTT 断 / 红=WiFi 断
+  // ③ 右：网络状态灯  绿=MQTT 通且数据新鲜 / 橙=MQTT 通但检测端掉线（超时无数据）/ 红=WiFi 断
   uint16_t nc = (WiFi.status() != WL_CONNECTED) ? C_RED
-                : (mqttOK ? C_GREEN : C_ORANGE);
+                : (mqttOK ? (dataFresh ? C_GREEN : C_ORANGE) : C_ORANGE);
   tft.fillCircle(122, 9, 3, nc);  // 视觉上跟文字中线对齐
 }
 
@@ -268,6 +287,52 @@ const char* airText() {
   if (strstr(d.airLevel, "中")) return "中";
   if (strstr(d.airLevel, "差")) return "差";
   return "离线";
+}
+
+// ============================== 局 部 刷 新 ==============================
+// 数据更新时只擦写"数值 + 色条"，图标/标签/卡片底都不动，
+// 整屏骨架只在翻页/断线时画一次 → 不再整页闪烁
+void refreshCardValue(const String& value, const char* unit,
+                      uint8_t idx, int y, uint16_t valColor) {
+  bool off = (!mqttOK || !dataFresh);   // MQTT 断 或 检测端掉线 → 显示 "--"
+  uint16_t vc = off ? C_OFFLINE : valColor;
+  String   vs = off ? "--" : value;
+
+  const uint16_t plate = cardPlate(idx);
+
+  // 擦掉旧数值（数值区：TEXT_X ~ 卡片右缘留 4px，高 16，宽 82px，覆盖所有数值长度）
+  tft.fillRect(TEXT_X, y + VALUE_Y_OFF, CARD_X + CARD_W - 4 - TEXT_X, 16, plate);
+  // 底部细色条（跟 drawListCard 一致）
+  tft.fillRoundRect(CARD_X + 6, y + CARD_H - 3, CARD_W - 12, 2, 1, vc);
+
+  // 画新数值（掉线不带单位，只显示 "--"）
+  String v = vs;
+  if (!off && unit && unit[0]) v += unit;
+  drawValue(v, TEXT_X, y + VALUE_Y_OFF, vc, plate);
+}
+
+void refreshPageValues(uint8_t pg) {
+  int y = LIST_Y0;
+  const int step = CARD_H + CARD_GAP;
+
+  if (pg == 0) {
+    bool t = d.valid && !isnan(d.temp);
+    refreshCardValue(t ? String(d.temp, 1) : "--", t ? "℃" : "", 0, y, C_RED); y += step;
+    bool h = d.valid && !isnan(d.humi);
+    refreshCardValue(h ? String(d.humi, 0) : "--", h ? "%" : "", 1, y, C_ORANGE); y += step;
+    bool c = d.valid && d.co2 >= 0;
+    refreshCardValue(c ? String(d.co2) : "--", c ? "ppm" : "", 2, y, C_GREEN); y += step;
+    bool r = d.valid && d.rainAdc >= 0 && d.rainLevel[0];
+    refreshCardValue(r ? String(d.rainLevel) : "--", "", 3, y, rainColor());
+  } else {
+    bool p = d.valid && !isnan(d.press);
+    refreshCardValue(p ? String(d.press, 1) : "--", p ? "hPa" : "", 4, y, C_SLATE); y += step;
+    bool a = d.valid && !isnan(d.alt);
+    refreshCardValue(a ? String(d.alt, 1) : "--", a ? "m" : "", 5, y, C_PURPLE); y += step;
+    refreshCardValue(airText(), "", 6, y, airColor()); y += step;
+    bool v = d.valid && d.tvoc >= 0;
+    refreshCardValue(v ? String(d.tvoc) : "--", v ? "ppb" : "", 7, y, C_ORANGE);
+  }
 }
 
 // ============================== 第 1 页 ==============================
@@ -410,6 +475,8 @@ int splitCsv(char* s, char* out[], int maxN) {
   return n;
 }
 
+// 回调：检测端把数据拆成 4 个主题分别发布，这里按"主题名"路由，
+// 只更新对应字段，其余字段保留上一次的值（d 是全局变量，断网也不丢）。
 void onMqttMessage(char* topic, byte* payload, unsigned int len) {
   if (len == 0 || len > 200) return;               // 长度护栏
 
@@ -417,29 +484,47 @@ void onMqttMessage(char* topic, byte* payload, unsigned int len) {
   memcpy(buf, payload, len);
   buf[len] = '\0';
 
-  char* f[9];
-  if (splitCsv(buf, f, 9) < 9) return;             // 字段不够直接丢弃
+  char* f[8];
+  int n = splitCsv(buf, f, 8);
 
-  WeatherData t;
-  t.temp    = atof(f[0]);
-  t.humi    = atof(f[1]);
-  t.co2     = atoi(f[2]);
-  t.tvoc    = atoi(f[3]);
-  t.press   = atof(f[4]);
-  t.alt     = atof(f[5]);
-  t.rainAdc = atoi(f[6]);
-  strncpy(t.rainLevel, f[7], sizeof(t.rainLevel) - 1);
-  t.rainLevel[sizeof(t.rainLevel) - 1] = '\0';
-  strncpy(t.airLevel,  f[8], sizeof(t.airLevel) - 1);
-  t.airLevel[sizeof(t.airLevel) - 1] = '\0';
+  if (strcmp(topicTempHum.c_str(),  topic) == 0) {        // 温湿度："温度,湿度"
+    if (n < 2) return;
+    float t = atof(f[0]);
+    float h = atof(f[1]);
+    if (t < -40.0f || t > 80.0f) return;                  // 合法性检查，防乱码
+    if (h <  0.0f || h > 100.0f) return;
+    d.temp = t; d.humi = h;
+    d.valid = true;
+  }
+  else if (strcmp(topicPressAlt.c_str(), topic) == 0) {    // 气压海拔："气压,海拔"
+    if (n < 2) return;
+    d.press = atof(f[0]);
+    d.alt   = atof(f[1]);
+    d.valid = true;
+  }
+  else if (strcmp(topicAir.c_str(), topic) == 0) {         // 空气："CO2,TVOC,空气质量"
+    if (n < 3) return;
+    d.co2  = atoi(f[0]);
+    d.tvoc = atoi(f[1]);
+    strncpy(d.airLevel, f[2], sizeof(d.airLevel) - 1);
+    d.airLevel[sizeof(d.airLevel) - 1] = '\0';
+    d.valid = true;
+  }
+  else if (strcmp(topicRain.c_str(), topic) == 0) {        // 雨量："雨量ADC,雨量等级"
+    if (n < 2) return;
+    d.rainAdc = atoi(f[0]);
+    strncpy(d.rainLevel, f[1], sizeof(d.rainLevel) - 1);
+    d.rainLevel[sizeof(d.rainLevel) - 1] = '\0';
+    d.valid = true;
+  }
+  else {
+    return;                                                // 未知主题，丢弃
+  }
 
-  // 合法性检查，防止乱码被当成数据显示
-  if (t.temp < -40.0f || t.temp > 80.0f) return;
-  if (t.humi < 0.0f   || t.humi > 100.0f) return;
-
-  t.valid = true;
-  d = t;                        // 全局保存：断网重连后仍是这批数据
-  needRedraw = true;            // 回调里只置标志，不画屏
+  // 记下"最后收到数据"的时间：检测端掉线超时判断用
+  lastDataMs = millis();
+  dataFresh  = true;
+  needRefresh = true;           // 回调里只置标志，不画屏（数据更新走局部刷新）
 }
 
 void connectMQTT() {
@@ -452,7 +537,11 @@ void connectMQTT() {
   sprintf(cid, "weather_disp_%04X", (uint16_t)(mac & 0xFFFF));
 
   if (mqtt.connect(cid)) {
-    mqtt.subscribe(MQTT_TOPIC);
+    // 订阅检测端的 4 个分主题（与发布端一一对应）
+    mqtt.subscribe(topicTempHum.c_str());
+    mqtt.subscribe(topicPressAlt.c_str());
+    mqtt.subscribe(topicAir.c_str());
+    mqtt.subscribe(topicRain.c_str());
     mqttOK = true;
     mqttBackoff = 3000;
   } else {
@@ -493,6 +582,12 @@ void setup() {
   mqtt.setCallback(onMqttMessage);
   mqtt.setBufferSize(256);
   mqtt.setKeepAlive(30);   // 30 秒没收到服务器回应就判定断线，屏幕随即变灰
+
+  // 拼出 4 个 MQTT 订阅主题（前缀与检测端 MQTT_TOPIC_BASE 保持一致）
+  topicTempHum  = String(MQTT_TOPIC_BASE) + "temp_hum";
+  topicPressAlt = String(MQTT_TOPIC_BASE) + "press_alt";
+  topicAir      = String(MQTT_TOPIC_BASE) + "air";
+  topicRain     = String(MQTT_TOPIC_BASE) + "rain";
 
   // 开机页 2.5 秒，期间后台继续连网
   drawWelcome();
@@ -556,6 +651,21 @@ void loop() {
     drawTopBar();
   }
 
+  // 检测端掉线检测：15 秒没收到数据 → dataFresh 置 false，
+  // 触发局部刷新把数值全部变 "--"（断电后不残留旧数据误导人）
+  if (dataFresh && millis() - lastDataMs > DATA_TIMEOUT_MS) {
+    dataFresh = false;
+    needRefresh = true;
+  }
+
+  // 数据更新（MQTT 消息）：只局部刷新当前页数值，不整屏重画 → 不闪
+  // 断网页显示中就先不刷（数据照常收，联网后重画就是最新值）
+  if (needRefresh) {
+    needRefresh = false;
+    if (WiFi.status() == WL_CONNECTED && !showingNoNet) refreshPageValues(page);
+  }
+
+  // 整屏重画：只在翻页 / 断网恢复 / MQTT 状态变化时发生（次数很少，不会闪成片）
   if (needRedraw) {
     needRedraw = false;
     if (page == 0) drawPage1(); else drawPage2();
